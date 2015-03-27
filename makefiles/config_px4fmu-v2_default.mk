@@ -28,24 +28,28 @@ MODULES		+= drivers/hmc5883
 MODULES		+= drivers/ms5611
 MODULES		+= drivers/mb12xx
 MODULES		+= drivers/sf0x
+MODULES		+= drivers/ll40ls
+MODULES		+= drivers/trone
 MODULES		+= drivers/gps
 MODULES		+= drivers/hil
+MODULES		+= drivers/hott
 MODULES		+= drivers/hott/hott_telemetry
 MODULES		+= drivers/hott/hott_sensors
 MODULES		+= drivers/blinkm
-MODULES		+= drivers/roboclaw
 MODULES		+= drivers/airspeed
 MODULES		+= drivers/ets_airspeed
 MODULES		+= drivers/meas_airspeed
 MODULES		+= drivers/frsky_telemetry
 MODULES		+= modules/sensors
 MODULES		+= drivers/mkblctrl
+MODULES		+= drivers/px4flow
+MODULES		+= drivers/oreoled
+MODULES		+= drivers/gimbal
 
-
-# Needs to be burned to the ground and re-written; for now,
-# just don't build it.
-#MODULES		+= drivers/mkblctrl
-
+# 
+# Simulink Model modules
+# 
+-include $(SIMULINK_MAKE)
 #
 # System commands
 #
@@ -59,7 +63,6 @@ MODULES		+= systemcmds/pwm
 MODULES		+= systemcmds/esc_calib
 MODULES		+= systemcmds/reboot
 MODULES		+= systemcmds/top
-MODULES		+= systemcmds/tests
 MODULES		+= systemcmds/config
 MODULES		+= systemcmds/nshterm
 MODULES		+= systemcmds/mtd
@@ -73,21 +76,15 @@ MODULES		+= modules/commander
 MODULES		+= modules/navigator
 MODULES		+= modules/mavlink
 MODULES		+= modules/gpio_led
-
-#
-# Simulink Model modules
-#
-#MODULES		+= modules/px4_simulink_app
--include $(SIMULINK_MAKE)
+MODULES		+= modules/uavcan
+MODULES 	+= modules/land_detector
 
 #
 # Estimation modules (EKF/ SO3 / other filters)
 #
 MODULES		+= modules/attitude_estimator_ekf
-MODULES		+= modules/attitude_estimator_so3
-MODULES		+= modules/fw_att_pos_estimator
+MODULES		+= modules/ekf_att_pos_estimator
 MODULES		+= modules/position_estimator_inav
-MODULES		+= examples/flow_position_estimator
 
 #
 # Vehicle Control
@@ -97,17 +94,12 @@ MODULES		+= modules/fw_pos_control_l1
 MODULES		+= modules/fw_att_control
 MODULES		+= modules/mc_att_control
 MODULES		+= modules/mc_pos_control
+MODULES 	+= modules/vtol_att_control
 
 #
 # Logging
 #
 MODULES		+= modules/sdlog2
-
-#
-# Unit tests
-#
-#MODULES 	+= modules/unit_test
-#MODULES 	+= modules/commander/commander_tests
 
 #
 # Library modules
@@ -127,8 +119,25 @@ MODULES		+= lib/mathlib/math/filter
 MODULES		+= lib/ecl
 MODULES		+= lib/external_lgpl
 MODULES		+= lib/geo
+MODULES		+= lib/geo_lookup
 MODULES		+= lib/conversion
 MODULES		+= lib/launchdetection
+MODULES		+= platforms/nuttx
+
+#
+# OBC challenge
+#
+MODULES		+= modules/bottle_drop
+
+#
+# PX4 flow estimator, good for indoors
+#
+MODULES		+= examples/flow_position_estimator
+
+#
+# Rover apps
+#
+MODULES		+= examples/rover_steering_control
 
 #
 # Demo apps
@@ -136,11 +145,11 @@ MODULES		+= lib/launchdetection
 #MODULES		+= examples/math_demo
 # Tutorial code from
 # https://pixhawk.ethz.ch/px4/dev/hello_sky
-# MODULES		+= examples/px4_simple_app
+#MODULES		+= examples/px4_simple_app
 
 # Tutorial code from
 # https://pixhawk.ethz.ch/px4/dev/daemon
-MODULES		+= examples/px4_daemon_app
+#MODULES		+= examples/px4_daemon_app
 
 # Tutorial code from
 # https://pixhawk.ethz.ch/px4/dev/debug_values
@@ -151,7 +160,10 @@ MODULES		+= examples/px4_daemon_app
 #MODULES			+= examples/fixedwing_control
 
 # Hardware test
-MODULES			+= examples/hwtest
+#MODULES			+= examples/hwtest
+
+# Generate parameter XML file
+GEN_PARAM_XML = 1
 
 #
 # Transitional support - add commands from the NuttX export archive.

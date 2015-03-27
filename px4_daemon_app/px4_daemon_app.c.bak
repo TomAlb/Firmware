@@ -1,0 +1,797 @@
+/****************************************************************************
+ *
+ *   Copyright (c) 2012, 2013 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ ****************************************************************************/
+
+/**
+ * @file px4_daemon_app.c
+ * daemon application example for PX4 autopilot
+ *
+ * @author Example User <mail@example.com>
+ */
+
+#define MW_RTOS_DEBUG 1
+#include <nuttx/config.h>
+#include <nuttx/sched.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <drivers/drv_led.h>
+/* Added headers */
+#include <stdlib.h>
+#include <limits.h>
+#include <sys/types.h>
+#include <pthread.h>
+#include <sched.h>
+#include <semaphore.h>
+#include <errno.h>
+#include <signal.h>
+#include <time.h>
+
+#include <systemlib/systemlib.h>
+#include <systemlib/err.h>
+
+static void timer_expiration(int signo, siginfo_t *locinfo, void *ucontext);
+static void baserateTask_timer_expiration(int signo, siginfo_t *locinfo, void *ucontext);
+void timer_test(void);
+#define BASERATE_TIMER_SIGNAL 17
+#define SIGVALUE_INT 42
+static sem_t sem;
+static int g_nsigreceived = 0;
+#define TERMTASK_STACK_SIZE 896
+#define SCHEDTASK_STACK_SIZE 896
+
+typedef struct {
+    int sigNo;
+    sigset_t sigMask;
+    double period;
+} baseRateInfo_t;
+
+void waitForThisEvent(int sigNo);
+void addBlockForThisEvent(int sigNo);
+void nuttxRTOSInit(double baseRatePeriod, int baseRatePriority, int numSubrates);
+void setTaskPeriod(double periodInSeconds, int sigNo);
+void schedulerTask(void* arg);
+void terminateTask(void* arg);
+void baseRateTask(void* arg);
+void timerTask(void* arg);
+
+static bool thread_should_exit = false;		/**< daemon exit flag */
+static bool thread_running = false;		/**< daemon status flag */
+static int daemon_task;				/**< Handle of daemon task / thread */
+
+/***********************************************
+ * Added for Simulink Threads
+ ************************************************/
+static baseRateInfo_t g_info;
+struct sched_param sp;
+
+#define CHECK_STATUS(status, expStatus, fcn) warnx("Call to %s returned status (%d)", fcn, status);if (status != expStatus) {warnx("Call to %s returned error status (%d).\n", fcn, status); perror(fcn);}
+#define CHECK_STATUS_NOT(status, errStatus, fcn) warnx("Call to %s returned status (%d)", fcn, status);if (status == errStatus) {warnx("Call to %s returned error status (%d).", fcn, status); perror(fcn);}
+
+static sem_t stopSem;
+static sem_t termSem;
+static sem_t baserateTaskSem;
+static bool baseRateLife = false;
+pthread_t terminateThread;
+pthread_t schedulerThread;
+pthread_t baseRateThread;
+
+/* ---------------------------- */
+/* Internally visible functions */
+/* ---------------------------- */
+/****************/
+//void setTaskPeriod(double periodInSeconds, int sigNo)
+//{
+//    timer_t timerId;
+//    struct sigevent sev;
+//    struct itimerspec its;
+//    long stNanoSec;
+//    int status;
+//    
+//    /* Create a timer */
+//    sev.sigev_notify = SIGEV_SIGNAL;
+//    sev.sigev_signo = sigNo;
+//    sev.sigev_value.sival_ptr = &timerId;
+//    
+//    warnx("*** Creating Timer here... %d ***", sigNo);
+//    /* only CLOCK_REALTIME is supported in NuttX */
+//    status = timer_create(CLOCK_REALTIME, &sev, &timerId);
+//    if (status != OK)
+//    {
+//      printf("timer_test: timer_create failed, errno=%d\n", errno);
+//      exit(-2);
+//    }
+//    CHECK_STATUS(status, 0,"timer_create");
+//    
+//    /* Arm real-time scheduling timer */
+//    stNanoSec = (long)(periodInSeconds * 1e9);
+//    its.it_value.tv_sec = stNanoSec / 1000000000;
+//    its.it_value.tv_nsec = stNanoSec % 1000000000;
+//    its.it_interval.tv_sec = its.it_value.tv_sec;
+//    its.it_interval.tv_nsec = its.it_value.tv_nsec;
+//
+//    warnx("*** Setting Timer here... %ld ns ***", stNanoSec);
+//    status = timer_settime(timerId, 0, &its, NULL);
+//    if (status != OK)
+//    {
+//      printf("timer_test: timer_settime failed, errno=%d\n", errno);
+//      exit(-4);
+//    }
+//
+//    CHECK_STATUS(status, 0,"timer_settime");
+//}
+
+/**********************/
+void schedulerTask(void* arg)
+{
+  struct sigaction act;
+  struct sigaction oact;
+  struct sigevent notify;
+  struct itimerspec timer;
+  long stNanoSec;
+  timer_t timerid;
+  int status;
+	sem_t timerSem;
+  
+  /* Initialize the local timer Semaphore */
+  sem_init(&timerSem, 0, 0);
+
+	/* unmask the signal used for the base rate task */
+  (void)sigemptyset(&g_info.sigMask);
+  (void)sigaddset(&g_info.sigMask, g_info.sigNo);
+  status = sigprocmask(SIG_UNBLOCK, &g_info.sigMask, NULL);
+  if (status != OK)
+  {
+    led_on(LED_RED);
+    errx(status, "ERROR sigprocmask failed");
+  }
+  
+//  act.sa_sigaction = baserateTask_timer_expiration;
+//  act.sa_flags = SA_SIGINFO;
+//  (void)sigfillset(&act.sa_mask);
+//  (void)sigdelset(&act.sa_mask, g_info.sigNo);
+//
+//  status = sigaction(g_info.sigNo, &act, &oact);
+//  if (status != OK)
+//    {
+//      led_on(LED_RED);
+//      errx(status, "px4SimSchedTask: ERROR sigaction failed");
+//    }
+
+  /* Create the POSIX timer */
+  warnx("Creating POSIX timer" );
+  notify.sigev_notify = SIGEV_SIGNAL;
+  notify.sigev_signo = g_info.sigNo;
+  notify.sigev_value.sival_int = SIGVALUE_INT;
+
+  status = timer_create(CLOCK_REALTIME, &notify, &timerid);
+  if (status != OK)
+  {
+    errx(status, "timer_create failed");
+    goto errorout;
+  }
+
+  /* Start the POSIX timer */
+  /* Arm real-time scheduling timer */
+  stNanoSec = (long)(g_info.period * 1e9);
+  timer.it_value.tv_sec = stNanoSec / 1000000000;
+  timer.it_value.tv_nsec = stNanoSec % 1000000000;
+  timer.it_interval.tv_sec = timer.it_value.tv_sec;
+  timer.it_interval.tv_nsec = timer.it_value.tv_nsec;
+
+  status = timer_settime(timerid, 0, &timer, NULL);
+  if (status != OK)
+  {
+    errx(status, "timer_settime failed (errno: %d)", errno);
+    goto errorout;
+  }
+
+  warnx("*** Scheduler Task Entering Loop %d... ***", baseRateLife);
+  while(baseRateLife) {
+      status = sem_wait(&timerSem);
+      if (status != 0) {
+          int error = errno;
+          if (error == EINTR){
+              // printf("px4SimSchedTask: sem_wait() successfully interrupted by signal\n" );
+              // wake up the base rate task
+		          sem_post(&baserateTaskSem);
+          }
+          else {
+              warnx("ERROR sem_wait failed, errno=%d\n" , error);
+          }
+      }
+      else {
+        warnx("ERROR awakened with no error!" );
+      }
+  }
+errorout:
+	// post semaphore so that the baserate task can exit
+  sem_post(&baserateTaskSem);
+  sem_destroy(&timerSem);
+  /* Then delete the timer */
+  status = timer_delete(timerid);
+  /* Detach the signal handler */
+  act.sa_sigaction = SIG_DFL;
+  status = sigaction(g_info.sigNo, &act, &oact);
+}
+
+/*********************/
+//void schedulerTask(void* arg)
+//{
+//    baseRateInfo_t taskinfo = *((baseRateInfo_t *)arg);
+//    warnx("*** Scheduler Task ... ***" );
+//    /* per-thread timer created in current Thread */
+//    setTaskPeriod(taskinfo.period, taskinfo.sigNo);
+//    warnx("*** Scheduler Task Entering Loop %d... ***", baseRateLife);
+//    while(baseRateLife) {
+//        waitForThisEvent(taskinfo.sigNo);
+//        warnx("### TIMER EXPIRED ###");
+//        sem_post(&baserateTaskSem);
+//    }
+//}
+
+void timerTask(void* arg)
+{
+//    baseRateInfo_t taskinfo = *((baseRateInfo_t *)arg);
+    warnx("*** Scheduler Task Timer Test ... ***" );   
+    timer_test();    
+}
+
+
+/* ---------------------------- */
+/* Externally visible functions */
+/* ---------------------------- */
+void waitForThisEvent(int sigNo)
+{
+        int iRet = -1;
+        siginfo_t oInfo;
+        struct timespec oTimeout;
+        sigset_t oMask;
+
+        led_on(LED_BLUE);
+        /* Max wait set to 1 second */
+        oTimeout.tv_sec = 1;
+        oTimeout.tv_nsec = 0;
+        sigemptyset(&oMask);
+        sigaddset(&oMask, sigNo);
+        while( iRet == -1 ) {
+            /* this call will block! */
+            led_on(LED_BLUE);
+            iRet = sigtimedwait(&oMask, &oInfo, &oTimeout);
+            led_on(LED_RED);
+            if ( -1 == iRet && EAGAIN == errno)
+            {
+                printf( "Caught EAGAIN in sigtimedwait\n" );
+                fflush(stdout);
+                sleep(2);
+            }
+            else
+            {
+                switch (oInfo.si_signo)
+                {
+                case SIGRTMIN:
+                    printf( "Caught SIGRTMIN in sigtimedwait( )\n" );
+                    fflush(stdout);
+                    break;
+                    /* Should never really get to default */
+                default:
+                    printf("Caught unexpected signal %ld, code %ld, errno %ld, iret %d\n", 
+                            oInfo.si_signo, oInfo.si_code, errno, iRet);
+                    fflush(stdout);
+                break;
+                }
+            }        
+        }
+}
+
+void addBlockForThisEvent(int sigNo)
+{
+    int status;
+    sigset_t sigMask;
+    sigemptyset(&sigMask);
+    sigaddset(&sigMask, sigNo);
+    status = sigprocmask(SIG_BLOCK, &sigMask, NULL);
+    CHECK_STATUS(status, 0, "pthread_sigmask");
+}
+
+
+/**
+ * daemon management function.
+ */
+__EXPORT int px4_daemon_app_main(int argc, char *argv[]);
+
+/**
+ * Mainloop of daemon.
+ */
+int px4_daemon_thread_main(int argc, char *argv[]);
+
+/****************************************************************
+ *****************************************************************/
+/* Define the Base Rate Task here */
+void baseRateTask(void *arg)
+{
+    int count = 0;
+    volatile bool noErr;
+    noErr = true;
+    while (noErr) {
+         led_off(LED_RED);
+         led_on(LED_BLUE);           
+         sem_wait(&baserateTaskSem);
+         led_on(LED_RED);
+         led_off(LED_BLUE);
+        /*  This will call the Model's step function */
+        warnx("*** baseRateTask blocking on baserateTaskSem [ %d ] ***", count++);        
+        /* Get model outputs here */
+        noErr = baseRateLife;
+    } /* while No Error */
+    warnx("+++ baseRateTask Exiting [ %d ] +++", count++);
+    /* terminate base rate thread - post Terminate Semaphore */
+    sem_post(&termSem);
+}
+
+/* Define the terminate task here */
+void terminateTask(void *arg)
+{
+    warnx("*** blocking on termSem semaphore");
+    sem_wait(&termSem);
+    warnx("** terminating the model");
+    /* Terminate model */
+    sem_post(&stopSem);
+}
+
+void nuttxRTOSInit(double baseRatePeriod, int baseRatePriority, int numSubrates)
+{
+    int status;
+    size_t stackSize;
+    
+    sched_lock();
+    status = sem_init(&termSem, 0, 0);
+    CHECK_STATUS(status, 0,"sem_init:termSem");
+    status = sem_init(&stopSem, 0, 0);
+    CHECK_STATUS(status, 0,"sem_init:stopSem");
+    status = sem_init(&baserateTaskSem, 0, 0);
+    CHECK_STATUS(status, 0,"sem_init:baserateTaskSem");
+    
+    // or you can use/check: _POSIX_PRIORITY_SCHEDULING
+    // _POSIX_THREAD_PRIORITY_SCHEDULING
+#if !defined (_POSIX_PRIORITY_SCHEDULING)
+    warnx("Priority scheduling is NOT supported by your system.");
+    warnx("The generated code will not run correctly because your");
+    warnx("model contains multiple rates and uses multi-tasking");
+    warnx("code generation mode. You can only run the generated code");
+    warnx("in single-tasking mode in your system. Open");
+    warnx("Simulation -> Configuration Parameters -> Solver dialog");
+    warnx("and set \"Tasking mode for periodic sample times\" parameter to SingleTasking.");
+    warnx("Re-build the Simulink model with the new settings and try executing the generated code again.");
+    exit(-1);
+#endif
+    
+    /* Set scheduling policy of the main thread to SCHED_FIFO */
+    sp.sched_priority = sched_get_priority_max(SCHED_DEFAULT) - 50;
+    status = sched_setscheduler(0, SCHED_FIFO, &sp);
+    CHECK_STATUS(status, 0,"sched_setscheduler");
+    
+    /* PTHREAD_STACK_MIN is the minimum stack size required to start a thread */
+    stackSize = 2048 + PTHREAD_STACK_MIN;
+    
+#ifdef MW_RTOS_DEBUG
+    warnx("   stackSize = %d sched_priority = %d", stackSize, sp.sched_priority);
+#endif
+    
+    /* set up info structure */
+    g_info.period = baseRatePeriod;
+    g_info.sigNo = BASERATE_TIMER_SIGNAL; // SIGRTMIN;
+    
+#ifdef MW_RTOS_DEBUG
+    warnx("   MW_BASERATE_PERIOD = %8.5f MW_BASERATE_PRIORITY = %d SIGRTMIN = 0x%08X", (double)baseRatePeriod, (int)baseRatePriority, SIGRTMIN);
+    warnx("   Init info.period = %f sigNo = 0x%08X", g_info.period, g_info.sigNo);
+#endif
+
+    /* Create the Terminate Task here */
+#ifdef MW_RTOS_DEBUG
+    warnx("**creating the terminate thread before calling task_create**");
+#endif
+    terminateThread = task_create("px4SimTermTask", SCHED_PRIORITY_DEFAULT, stackSize, (void *) terminateTask, (void *) &g_info);
+    // terminateThread = task_spawn_cmd("px4SimTermTask", SCHED_FIFO, baseRatePriority, stackSize, (void *) terminateTask, (void *) &g_info);
+#ifdef MW_RTOS_DEBUG
+    warnx("** Terminate Task ID = %d : 0x%08X", terminateThread, terminateThread);
+#endif
+    if (terminateThread > 0) {
+        /* configure the scheduler */
+        struct sched_param param;
+        param.sched_priority = baseRatePriority;
+        sched_setscheduler(terminateThread, SCHED_FIFO, &param);
+    }
+
+    /* Create the Base Rate Task here */
+#ifdef MW_RTOS_DEBUG
+    warnx("**creating the baserate thread before calling task_create**");
+#endif
+    baseRateThread = task_create("px4SimBaseTask", baseRatePriority, stackSize, (void *) baseRateTask, (void *) &g_info);
+//     baseRateThread = task_spawn_cmd("px4SimBaseTask", SCHED_FIFO, baseRatePriority, stackSize, (void *) baseRateTask, (void *) &g_info);
+#ifdef MW_RTOS_DEBUG
+    warnx("** Base Rate Task ID = %d : 0x%08X", baseRateThread, baseRateThread);
+#endif
+    if (baseRateThread > 0) {
+        /* configure the scheduler */
+        struct sched_param param;
+        param.sched_priority = baseRatePriority;
+        sched_setscheduler(baseRateThread, SCHED_FIFO, &param);
+    }       
+
+    /* Create the Scheduler Task here */
+#ifdef MW_RTOS_DEBUG
+    warnx("**creating the scheduler thread before calling task_create**");
+#endif
+//    schedulerThread = task_spawn_cmd("px4SimTimerTask", SCHED_DEFAULT, SCHED_PRIORITY_DEFAULT, 4096, (void *)timerTask, (void *) &g_info);
+    schedulerThread = task_create("px4SimSchedTask", SCHED_PRIORITY_DEFAULT, stackSize, (void *) schedulerTask, (void *) &g_info);
+#ifdef MW_RTOS_DEBUG
+    warnx("** Scheduler Task ID = %d : 0x%08X", schedulerThread, schedulerThread);
+#endif
+    if (schedulerThread > 0) {
+        /* configure the scheduler */
+        struct sched_param param;
+        param.sched_priority = baseRatePriority;
+        sched_setscheduler(schedulerThread, SCHED_FIFO, &param);
+    }
+
+#ifdef MW_RTOS_DEBUG
+    warnx("**DONE! creating simulink task threads**");
+#endif
+    sched_unlock();
+}
+
+/****************************************************************
+ *****************************************************************/
+
+/**
+ * Print the correct usage.
+ */
+static void usage(const char *reason);
+
+static void
+        usage(const char *reason)
+{
+    if (reason)
+        warnx("%s", reason);
+    errx(1, "usage: daemon {start|stop|status} [-p <additional params>]\n");
+}
+
+/**
+ * The daemon app only briefly exists to start
+ * the background job. The stack size assigned in the
+ * Makefile does only apply to this management task.
+ *
+ * The actual stack size should be set in the call
+ * to task_create().
+ */
+int px4_daemon_app_main(int argc, char *argv[])
+{
+    if (argc < 1)
+        usage("missing command");
+    if (!strcmp(argv[1], "start")) {
+			/* just start the Simulink Tasks here */    	
+	    baseRateLife = true;
+    	nuttxRTOSInit(2,SCHED_PRIORITY_DEFAULT,0);
+    	
+//        if (thread_running) {
+//            warnx("daemon already running\n");
+//            /* this is not an error */
+//            exit(0);
+//        }
+//        thread_should_exit = false;
+//        daemon_task = task_spawn_cmd("daemon_app_main",
+//                SCHED_DEFAULT,
+//                SCHED_PRIORITY_DEFAULT,
+//                4096,
+//                px4_daemon_thread_main,
+//                (argv) ? (const char **)&argv[2] : (const char **)NULL);
+      warnx("** End of Start **");
+      exit(0);
+    }
+    
+    if (!strcmp(argv[1], "base")) {
+        warnx("base rate sem post");
+        sem_post(&baserateTaskSem);    
+        warnx("** End of Base **");
+        exit(0);
+    }
+    if (!strcmp(argv[1], "timer")) {
+        warnx("timer test");
+        timer_test();    
+        warnx("** End of Timer **");
+        exit(0);
+    }
+    if (!strcmp(argv[1], "stop")) {
+        warnx("baseRateLife is set to false");
+		    baseRateLife = false;
+        sem_post(&baserateTaskSem);    
+		    /* wait until the tasks completely finish */
+		    warnx("waiting on stopSem...");
+		    sem_wait(&stopSem);
+        warnx("** End of Stop **");
+        exit(0);
+    }
+    if (!strcmp(argv[1], "status")) {
+        if (thread_running) {
+            warnx("\trunning\n");
+        } else {
+            warnx("\tnot started\n");
+        }
+        exit(0);
+    }
+    usage("unrecognized command");
+    exit(1);
+}
+
+int px4_daemon_thread_main(int argc, char *argv[]) {
+    warnx("[daemon] starting\n");
+    thread_running = true;
+    baseRateLife = true;
+   	nuttxRTOSInit(2,SCHED_PRIORITY_DEFAULT,0);
+//		timer_test();
+
+    while (!thread_should_exit) {
+//         warnx("Hello daemon!\n");
+        sleep(1);
+    }
+    warnx("[daemon] exiting.\n");
+    baseRateLife = false;
+    thread_running = false;
+    /* wait until the tasks completely finish */
+    warnx("[daemon] waiting on stopSem...\n");
+    sem_wait(&stopSem);
+    return 0;
+}
+
+static void baserateTask_timer_expiration(int signo, siginfo_t *locinfo, void *ucontext)
+{
+  sigset_t oldset;
+  sigset_t allsigs;
+  int status;
+
+  g_nsigreceived++;
+  /* Check signo */
+  if (signo != BASERATE_TIMER_SIGNAL)
+  {
+    warnx("timer_expiration: ERROR expected signo=%d\n" , BASERATE_TIMER_SIGNAL);
+  }
+
+  /* Check siginfo */
+  if (locinfo->si_value.sival_int != SIGVALUE_INT)
+  {
+    warnx("timer_expiration: ERROR sival_int=%d expected %d\n",
+            locinfo->si_value.sival_int, SIGVALUE_INT);
+  }
+//  else
+//    {
+//      printf("timer_expiration: sival_int=%d\n" , locinfo->si_value.sival_int);
+//    }
+    
+  if (locinfo->si_signo != BASERATE_TIMER_SIGNAL)
+  {
+    warnx("timer_expiration: ERROR expected si_signo=%d, got=%d\n",
+             BASERATE_TIMER_SIGNAL, locinfo->si_signo);
+  }
+
+//  if (locinfo->si_code == SI_TIMER)
+//    {
+//      printf("timer_expiration: si_code=%d (SI_TIMER)\n" , locinfo->si_code);
+//    }
+//  else
+//    {
+//      printf("timer_expiration: ERROR si_code=%d, expected SI_TIMER=%d\n",
+//             locinfo->si_code, SI_TIMER);
+//    }
+//
+//  /* Check ucontext_t */
+//  printf("timer_expiration: ucontext=%p\n" , ucontext);
+//
+//  fflush(stdout);
+
+	/* post a semaphore to the baserate task */
+	sem_post(&baserateTaskSem);
+}
+
+
+static void timer_expiration(int signo, siginfo_t *locinfo, void *ucontext)
+{
+  sigset_t oldset;
+  sigset_t allsigs;
+  int status;
+
+  printf("timer_expiration: Received signal %d\n" , signo);
+  g_nsigreceived++;
+  /* Check signo */
+  if (signo != BASERATE_TIMER_SIGNAL)
+    {
+      printf("timer_expiration: ERROR expected signo=%d\n" , BASERATE_TIMER_SIGNAL);
+    }
+
+  /* Check siginfo */
+  if (locinfo->si_value.sival_int != SIGVALUE_INT)
+    {
+      printf("timer_expiration: ERROR sival_int=%d expected %d\n",
+              locinfo->si_value.sival_int, SIGVALUE_INT);
+    }
+  else
+    {
+      printf("timer_expiration: sival_int=%d\n" , locinfo->si_value.sival_int);
+    }
+    
+  if (locinfo->si_signo != BASERATE_TIMER_SIGNAL)
+    {
+      printf("timer_expiration: ERROR expected si_signo=%d, got=%d\n",
+               BASERATE_TIMER_SIGNAL, locinfo->si_signo);
+    }
+
+  if (locinfo->si_code == SI_TIMER)
+    {
+      printf("timer_expiration: si_code=%d (SI_TIMER)\n" , locinfo->si_code);
+    }
+  else
+    {
+      printf("timer_expiration: ERROR si_code=%d, expected SI_TIMER=%d\n",
+             locinfo->si_code, SI_TIMER);
+    }
+
+  /* Check ucontext_t */
+  printf("timer_expiration: ucontext=%p\n" , ucontext);
+
+  fflush(stdout);
+}
+
+/**************************************************************************
+* Public Functions
+**************************************************************************/
+
+void timer_test(void)
+{
+  sigset_t sigset;
+  struct sigaction act;
+  struct sigaction oact;
+  struct sigevent notify;
+  struct itimerspec timer;
+  timer_t timerid;
+  int status;
+  int i;
+
+  printf("timer_test: Initializing semaphore to 0\n" );
+  sem_init(&sem, 0, 0);
+
+  /* Start waiter thread */
+
+  printf("timer_test: Unmasking signal %d\n" , BASERATE_TIMER_SIGNAL);
+
+  (void)sigemptyset(&sigset);
+  (void)sigaddset(&sigset, BASERATE_TIMER_SIGNAL);
+  status = sigprocmask(SIG_UNBLOCK, &sigset, NULL);
+  if (status != OK)
+    {
+      printf("timer_test: ERROR sigprocmask failed, status=%d\n",
+              status);
+    }
+
+  printf("timer_test: Registering signal handler\n" );
+  act.sa_sigaction = timer_expiration;
+  act.sa_flags = SA_SIGINFO;
+
+  (void)sigfillset(&act.sa_mask);
+  (void)sigdelset(&act.sa_mask, BASERATE_TIMER_SIGNAL);
+
+  status = sigaction(BASERATE_TIMER_SIGNAL, &act, &oact);
+  if (status != OK)
+    {
+      printf("timer_test: ERROR sigaction failed, status=%d\n" , status);
+    }
+
+#ifndef MW_RTOS_DEBUG
+  printf("timer_test: oact.sigaction=%p oact.sa_flags=%x oact.sa_mask=%x\n",
+          oact.sa_sigaction, oact.sa_flags, oact.sa_mask);
+#endif
+
+  /* Create the POSIX timer */
+
+  printf("timer_test: Creating timer\n" );
+
+  notify.sigev_notify = SIGEV_SIGNAL;
+  notify.sigev_signo = BASERATE_TIMER_SIGNAL;
+  notify.sigev_value.sival_int = SIGVALUE_INT;
+
+  status = timer_create(CLOCK_REALTIME, &notify, &timerid);
+  if (status != OK)
+    {
+      printf("timer_test: timer_create failed, errno=%d\n", errno);
+      goto errorout;
+    }
+
+  /* Start the POSIX timer */
+
+  printf("timer_test: Starting timer\n" );
+
+  timer.it_value.tv_sec = 2;
+  timer.it_value.tv_nsec = 0;
+  timer.it_interval.tv_sec = 2;
+  timer.it_interval.tv_nsec = 0;
+
+  status = timer_settime(timerid, 0, &timer, NULL);
+  if (status != OK)
+    {
+      printf("timer_test: timer_settime failed, errno=%d\n", errno);
+      goto errorout;
+    }
+
+  /* Take the semaphore */
+
+  for (i = 0; i < 5; i++)
+    {
+      printf("timer_test: Waiting on semaphore\n" );
+      fflush(stdout);
+      status = sem_wait(&sem);
+      if (status != 0)
+        {
+          int error = errno;
+          if (error == EINTR)
+            {
+              printf("timer_test: sem_wait() successfully interrupted by signal\n" );
+            }
+          else
+            {
+              printf("timer_test: ERROR sem_wait failed, errno=%d\n" , error);
+            }
+        }
+      else
+        {
+          printf("timer_test: ERROR awakened with no error!\n" );
+        }
+      printf("timer_test: g_nsigreceived=%d\n", g_nsigreceived);
+    }
+
+errorout:
+  sem_destroy(&sem);
+
+  /* Then delete the timer */
+
+  printf("timer_test: Deleting timer\n" );
+  status = timer_delete(timerid);
+  if (status != OK)
+    {
+      printf("timer_test: timer_create failed, errno=%d\n", errno);
+    }
+
+  /* Detach the signal handler */
+
+  act.sa_sigaction = SIG_DFL;
+  status = sigaction(BASERATE_TIMER_SIGNAL, &act, &oact);
+
+  printf("timer_test: done\n" );
+  fflush(stdout);
+}

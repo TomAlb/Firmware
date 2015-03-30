@@ -1,4 +1,4 @@
-sercon
+#sercon - in the latest release sercon already gets called
 usleep 1000
 uorb start
 usleep 1000
@@ -20,7 +20,8 @@ usleep 1000
 #usleep 1000
 #gps start
 #usleep 1000
-attitude_estimator_ekf start
+#attitude_estimator_ekf start - the latest release does not use this anymore
+ekf_att_pos_estimator start
 usleep 1000
 #attitude_estimator_so3 start
 #usleep 1000
